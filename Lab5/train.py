@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 from torch.amp import autocast, GradScaler
+from tqdm import tqdm
 from src.yolo import getODmodel
 from yolo_loss import YOLOv3Loss
 from src.dataset import VocDetectorDataset, train_data_pipelines, test_data_pipelines, collate_fn
@@ -147,7 +148,15 @@ def main():
         print(f'{"="*60}')
         
         train_loss = 0.0
-        for i, (images, target) in enumerate(train_loader):
+        train_box_loss = 0.0
+        train_obj_loss = 0.0
+        train_cls_loss = 0.0
+        
+        # Create progress bar
+        pbar = tqdm(train_loader, desc=f'Training', 
+                   bar_format='{l_bar}{bar:30}{r_bar}{bar:-30b}')
+        
+        for i, (images, target) in enumerate(pbar):
             # Move to device
             images = images.to(device)
             target = [t.to(device) for t in target]
@@ -163,29 +172,50 @@ def main():
             scaler.step(optimizer)
             scaler.update()
             
+            # Accumulate losses
             train_loss += loss_dict['total'].item()
+            train_box_loss += loss_dict['box'].item()
+            train_obj_loss += loss_dict['obj'].item()
+            train_cls_loss += loss_dict['cls'].item()
             
-            # Print progress
-            if i % 50 == 0:
-                outstring = f'Iter [{i+1}/{len(train_loader)}], Loss: '
-                outstring += ', '.join(f"{key}={val.item():.3f}" for key, val in loss_dict.items())
-                print(outstring)
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{loss_dict['total'].item():.4f}",
+                'box': f"{loss_dict['box'].item():.3f}",
+                'obj': f"{loss_dict['obj'].item():.3f}",
+                'cls': f"{loss_dict['cls'].item():.3f}"
+            })
         
         # Update learning rate
         lr_scheduler.step()
         current_lr = lr_scheduler.get_last_lr()[0]
         
-        # Calculate average training loss
+        # Calculate average training losses
         train_loss /= len(train_loader)
-        print(f'\nTraining Loss: {train_loss:.4f}')
-        print(f'Learning Rate: {current_lr:.6f}')
+        train_box_loss /= len(train_loader)
+        train_obj_loss /= len(train_loader)
+        train_cls_loss /= len(train_loader)
+        
+        print(f'\n📊 Training Summary:')
+        print(f'  Total Loss:  {train_loss:.4f}')
+        print(f'  Box Loss:    {train_box_loss:.4f}')
+        print(f'  Obj Loss:    {train_obj_loss:.4f}')
+        print(f'  Class Loss:  {train_cls_loss:.4f}')
+        print(f'  Learning Rate: {current_lr:.6f}')
         
         # ===== Validation phase =====
-        print('\nValidating...')
+        print('\n🔍 Validating...')
         with torch.no_grad():
             val_loss = 0.0
+            val_box_loss = 0.0
+            val_obj_loss = 0.0
+            val_cls_loss = 0.0
             model.eval()
-            for i, (images, target) in enumerate(val_loader):
+            
+            val_pbar = tqdm(val_loader, desc='Validation', 
+                          bar_format='{l_bar}{bar:30}{r_bar}{bar:-30b}')
+            
+            for i, (images, target) in enumerate(val_pbar):
                 # Move to device
                 images = images.to(device)
                 target = [t.to(device) for t in target]
@@ -193,10 +223,28 @@ def main():
                 # Forward pass
                 pred = model(images)
                 loss_dict = criterion(pred, target)
+                
+                # Accumulate losses
                 val_loss += loss_dict['total'].item()
+                val_box_loss += loss_dict['box'].item()
+                val_obj_loss += loss_dict['obj'].item()
+                val_cls_loss += loss_dict['cls'].item()
+                
+                # Update progress bar
+                val_pbar.set_postfix({
+                    'loss': f"{loss_dict['total'].item():.4f}"
+                })
             
             val_loss /= len(val_loader)
-            print(f'Validation Loss: {val_loss:.4f}')
+            val_box_loss /= len(val_loader)
+            val_obj_loss /= len(val_loader)
+            val_cls_loss /= len(val_loader)
+            
+            print(f'\n📊 Validation Summary:')
+            print(f'  Total Loss:  {val_loss:.4f}')
+            print(f'  Box Loss:    {val_box_loss:.4f}')
+            print(f'  Obj Loss:    {val_obj_loss:.4f}')
+            print(f'  Class Loss:  {val_cls_loss:.4f}')
         
         # ===== Save checkpoints =====
         # Save best model
@@ -218,17 +266,23 @@ def main():
         # ===== Evaluate mAP =====
         if (epoch + 1) % 5 == 0:
             print('\n' + '-'*60)
-            print('Evaluating mAP on validation set...')
+            print('📈 Evaluating mAP on validation set...')
             print('-'*60)
             val_aps = evaluate(model, eval_loader)
             mean_ap = np.mean(val_aps)
-            print(f'Epoch {epoch+1} - mAP: {mean_ap:.4f}')
+            print(f'🎯 Epoch {epoch+1} - mAP: {mean_ap:.4f}')
             print('-'*60)
+        
+        # Print epoch summary
+        print(f'\n{"="*60}')
+        print(f'✅ Epoch {epoch+1}/{num_epochs} Completed')
+        print(f'{"="*60}')
     
     # ========== Training complete ==========
     print('\n' + '='*60)
-    print('Training completed!')
-    print(f'Best validation loss: {best_val_loss:.5f}')
+    print('🎉 Training completed!')
+    print(f'🏆 Best validation loss: {best_val_loss:.5f}')
+    print(f'💾 Best model saved at: checkpoints/best_detector.pth')
     print('='*60)
 
 
