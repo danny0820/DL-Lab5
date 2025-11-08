@@ -1,0 +1,282 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='none'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        inputs: predictions after sigmoid, shape [N, *]
+        targets: ground truth labels (0 or 1), shape [N, *]
+        """
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        probs = torch.sigmoid(inputs)
+        p_t = targets * probs + (1 - targets) * (1 - probs)
+        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+        focal_loss = alpha_t * (1 - p_t) ** self.gamma * bce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+        
+class BoxLoss(nn.Module):
+    def __init__(self, loss_type='giou'):
+        super(BoxLoss, self).__init__()
+        self.type = loss_type
+
+    def forward(self, pred_boxes, target_boxes, anchors):
+        """
+        pred_boxes: [bsz, grid, grid, anchors, 4] (raw predictions)
+        target_boxes: [bsz, grid, grid, anchors, 4] (encoded targets)
+        anchors: list of (w, h) for the anchors at this scale (normalized 0-1)
+        """
+        bsz, grid, _, num_anchors, _ = pred_boxes.size()
+        device = pred_boxes.device
+        dtype = pred_boxes.dtype
+
+        anchors = torch.tensor(anchors, device=device, dtype=dtype).view(1, 1, 1, num_anchors, 2)
+
+        # coordinate offset for each grid cell
+        grid_range = torch.arange(grid, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(grid_range, grid_range, indexing='ij')
+        grid_x = grid_x.view(1, grid, grid, 1, 1)
+        grid_y = grid_y.view(1, grid, grid, 1, 1)
+
+        if self.type == 'giou':
+            eps = 1e-9
+            # 1. predicted centre (cell offset) and size
+            pred_xy = torch.sigmoid(pred_boxes[..., 0:2])  # [bsz, grid, grid, anchors, 2]
+            pred_wh = torch.exp(pred_boxes[..., 2:4]) * anchors  # [bsz, grid, grid, anchors, 2]
+            
+            # 2. target centre still stored as cell offset, convert to same system
+            target_xy = target_boxes[..., 0:2]  # [bsz, grid, grid, anchors, 2]
+            target_wh = target_boxes[..., 2:4]  # [bsz, grid, grid, anchors, 2]
+            
+            # 3. Convert both to image-normalised coordinates
+            pred_xy_norm = (pred_xy + torch.cat([grid_x, grid_y], dim=-1)) / grid
+            target_xy_norm = (target_xy + torch.cat([grid_x, grid_y], dim=-1)) / grid
+            
+            # 4. boxes to corner format
+            pred_x1y1 = pred_xy_norm - pred_wh / 2
+            pred_x2y2 = pred_xy_norm + pred_wh / 2
+            target_x1y1 = target_xy_norm - target_wh / 2
+            target_x2y2 = target_xy_norm + target_wh / 2
+            
+            # 5. Intersection box
+            inter_x1y1 = torch.max(pred_x1y1, target_x1y1)
+            inter_x2y2 = torch.min(pred_x2y2, target_x2y2)
+            inter_wh = (inter_x2y2 - inter_x1y1).clamp(min=0)
+            inter_area = inter_wh[..., 0] * inter_wh[..., 1]
+            
+            # 6. union area
+            pred_area = pred_wh[..., 0] * pred_wh[..., 1]
+            target_area = target_wh[..., 0] * target_wh[..., 1]
+            union = pred_area + target_area - inter_area + eps
+            
+            iou = inter_area / union
+            
+            # 7. smallest enclosing box
+            c_x1y1 = torch.min(pred_x1y1, target_x1y1)
+            c_x2y2 = torch.max(pred_x2y2, target_x2y2)
+            c_wh = c_x2y2 - c_x1y1
+            c_area = c_wh[..., 0] * c_wh[..., 1] + eps
+            
+            giou = iou - (c_area - union) / c_area
+            giou_loss = 1.0 - giou
+            
+            return giou_loss
+
+        elif self.type == 'mse':
+            # MSE box loss
+            # decode predicted boxes
+            pred_xy = torch.sigmoid(pred_boxes[..., 0:2])
+            pred_wh = pred_boxes[..., 2:4]  # keep in log space for MSE
+            
+            # target boxes
+            target_xy = target_boxes[..., 0:2]
+            target_wh = target_boxes[..., 2:4]  # already in log space
+            
+            # MSE loss on xy
+            xy_loss = F.mse_loss(pred_xy, target_xy, reduction='none')
+            # MSE loss on wh in log space
+            wh_loss = F.mse_loss(pred_wh, target_wh, reduction='none')
+            
+            box_loss = xy_loss.sum(dim=-1) + wh_loss.sum(dim=-1)
+            
+            return box_loss
+        else:
+            raise NotImplementedError(f"Box loss type '{self.type}' not implemented.")
+class YOLOv3Loss(nn.Module):
+    def __init__(
+        self,
+        lambda_coord=2.0,
+        lambda_obj=1.0,
+        lambda_noobj=0.2,
+        lambda_class=1.0,
+        anchors=None,
+    ):
+        super().__init__()
+        self.lambda_coord = lambda_coord
+        self.lambda_obj = lambda_obj
+        self.lambda_noobj = lambda_noobj
+        self.lambda_class = lambda_class
+
+        self.mse_loss = nn.MSELoss(reduction='none')
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.focal_loss = FocalLoss(reduction='none')
+        self.box_loss = BoxLoss(loss_type='giou')
+        self.anchors = anchors  # List of anchor boxes per scale
+    # Check for NaNs in any of the loss scalars and print which one is NaN
+    
+    def forward(self, predictions, targets):
+        """
+        predictions: list of 3 scales, each [batch, grid, grid, 75]
+        targets: list of 3 scales, each [batch, grid, grid, 3, 25]
+        """
+        device = predictions[0].device
+
+        total_box_loss = torch.tensor(0.0, device=device)
+        total_obj_loss_pos = torch.tensor(0.0, device=device)
+        total_obj_loss_neg = torch.tensor(0.0, device=device)
+        total_cls_loss = torch.tensor(0.0, device=device)
+
+        total_num_pos = 0
+        total_num_neg = 0
+        batch_size = predictions[0].size(0)
+
+        for pred, gt, anchors in zip(predictions, targets, self.anchors):
+            bsz, grid, _, num_anchors, _ = gt.shape
+            # Reshape prediction: [B, H, W, 75] -> [B, H, W, 3, 25]
+            pred = pred.view(bsz, grid, grid, num_anchors, -1)
+            
+            # Extract ground truth components
+            obj_mask = gt[..., 4] > 0  # [bsz, grid, grid, num_anchors]
+            noobj_mask = gt[..., 4] == 0
+            
+            # Get predicted components
+            pred_boxes = pred[..., 0:4]  # [bsz, grid, grid, num_anchors, 4]
+            pred_conf = pred[..., 4]  # [bsz, grid, grid, num_anchors]
+            pred_cls = pred[..., 5:]  # [bsz, grid, grid, num_anchors, 20]
+            
+            # Get target components
+            target_boxes = gt[..., 0:4]
+            target_conf = gt[..., 4]
+            target_cls = gt[..., 5:]
+            
+            # Count positive and negative samples
+            num_pos = obj_mask.sum().item()
+            num_neg = noobj_mask.sum().item()
+            total_num_pos += num_pos
+            total_num_neg += num_neg
+            
+            # Box loss (only for positive samples)
+            if num_pos > 0:
+                # Apply sigmoid to xy and exp to wh in box loss computation
+                pred_boxes_pos = pred_boxes[obj_mask]  # [num_pos, 4]
+                target_boxes_pos = target_boxes[obj_mask]  # [num_pos, 4]
+                
+                # Reshape for box loss computation
+                pred_boxes_pos = pred_boxes_pos.view(num_pos, 1, 1, 1, 4)
+                target_boxes_pos = target_boxes_pos.view(num_pos, 1, 1, 1, 4)
+                
+                # Compute box loss
+                box_loss = self.box_loss(pred_boxes_pos, target_boxes_pos, anchors)
+                total_box_loss += box_loss.sum()
+                
+                # Objectness loss for positive samples
+                # Calculate IoU between predicted and target boxes for confidence target
+                with torch.no_grad():
+                    pred_xy = torch.sigmoid(pred_boxes_pos[..., 0:2])
+                    pred_wh = torch.exp(pred_boxes_pos[..., 2:4]) * torch.tensor(anchors, device=device).view(1, 1, 1, len(anchors), 2)
+                    target_xy = target_boxes_pos[..., 0:2]
+                    target_wh = target_boxes_pos[..., 2:4]
+                    
+                    # Simple IoU calculation for confidence target
+                    pred_boxes_iou = torch.cat([pred_xy, pred_wh], dim=-1).view(num_pos, 4)
+                    target_boxes_iou = torch.cat([target_xy, target_wh], dim=-1).view(num_pos, 4)
+                    
+                    ious = self._box_iou(pred_boxes_iou, target_boxes_iou)
+                    ious = ious.clamp(0, 1)
+                
+                pred_conf_pos = pred_conf[obj_mask]
+                obj_loss = self.bce_loss(pred_conf_pos, ious)
+                total_obj_loss_pos += obj_loss.sum()
+                
+                # Class loss (only for positive samples)
+                pred_cls_pos = pred_cls[obj_mask]  # [num_pos, 20]
+                target_cls_pos = target_cls[obj_mask]  # [num_pos, 20]
+                cls_loss = self.bce_loss(pred_cls_pos, target_cls_pos)
+                total_cls_loss += cls_loss.sum()
+            
+            # Objectness loss for negative samples (no object)
+            if num_neg > 0:
+                pred_conf_neg = pred_conf[noobj_mask]
+                target_conf_neg = torch.zeros_like(pred_conf_neg)
+                noobj_loss = self.bce_loss(pred_conf_neg, target_conf_neg)
+                total_obj_loss_neg += noobj_loss.sum()
+
+        pos_denom = max(total_num_pos, 1)
+        neg_denom = max(total_num_neg, 1)
+
+        total_box_loss = total_box_loss / pos_denom
+        total_obj_loss = total_obj_loss_pos / pos_denom
+        total_cls_loss = total_cls_loss / pos_denom
+        total_noobj_loss = total_obj_loss_neg / neg_denom
+
+        # Combined loss
+        
+        total_loss = (
+            self.lambda_coord * total_box_loss +
+            self.lambda_obj * total_obj_loss +
+            self.lambda_noobj * total_noobj_loss +
+            self.lambda_class * total_cls_loss
+        )
+        
+        loss_dict = {
+            'total': total_loss,
+            'box': total_box_loss,
+            'obj': total_obj_loss,
+            'noobj': total_noobj_loss,
+            'cls': total_cls_loss,
+        }
+        
+        return loss_dict
+    
+    def _box_iou(self, box1, box2):
+        """
+        Calculate IoU between boxes in (x, y, w, h) format
+        box1, box2: [N, 4]
+        """
+        # Convert to corner format
+        b1_x1 = box1[:, 0] - box1[:, 2] / 2
+        b1_y1 = box1[:, 1] - box1[:, 3] / 2
+        b1_x2 = box1[:, 0] + box1[:, 2] / 2
+        b1_y2 = box1[:, 1] + box1[:, 3] / 2
+        
+        b2_x1 = box2[:, 0] - box2[:, 2] / 2
+        b2_y1 = box2[:, 1] - box2[:, 3] / 2
+        b2_x2 = box2[:, 0] + box2[:, 2] / 2
+        b2_y2 = box2[:, 1] + box2[:, 3] / 2
+        
+        # Intersection
+        inter_x1 = torch.max(b1_x1, b2_x1)
+        inter_y1 = torch.max(b1_y1, b2_y1)
+        inter_x2 = torch.min(b1_x2, b2_x2)
+        inter_y2 = torch.min(b1_y2, b2_y2)
+        
+        inter_area = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
+        
+        # Union
+        b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+        b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+        union = b1_area + b2_area - inter_area + 1e-16
+        
+        iou = inter_area / union
+        return iou
