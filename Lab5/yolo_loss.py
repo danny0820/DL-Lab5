@@ -178,32 +178,71 @@ class YOLOv3Loss(nn.Module):
             
             # Box loss (only for positive samples)
             if num_pos > 0:
-                # Apply sigmoid to xy and exp to wh in box loss computation
+                # Directly compute GIoU loss without using BoxLoss class
+                # Extract positive boxes
                 pred_boxes_pos = pred_boxes[obj_mask]  # [num_pos, 4]
                 target_boxes_pos = target_boxes[obj_mask]  # [num_pos, 4]
                 
-                # Reshape for box loss computation
-                pred_boxes_pos = pred_boxes_pos.view(num_pos, 1, 1, 1, 4)
-                target_boxes_pos = target_boxes_pos.view(num_pos, 1, 1, 1, 4)
+                # Get anchor indices for positive samples
+                pos_indices = obj_mask.nonzero(as_tuple=False)  # [num_pos, 4]
+                anchor_indices = pos_indices[:, 3]  # [num_pos]
                 
-                # Compute box loss
-                box_loss = self.box_loss(pred_boxes_pos, target_boxes_pos, anchors)
-                total_box_loss += box_loss.sum()
+                # Get corresponding anchors
+                anchor_tensor = torch.tensor(anchors, device=device, dtype=pred_boxes_pos.dtype)
+                anchors_for_pos = anchor_tensor[anchor_indices]  # [num_pos, 2]
+                
+                # Decode predictions (same as in BoxLoss)
+                eps = 1e-9
+                pred_xy = torch.sigmoid(pred_boxes_pos[:, 0:2])  # [num_pos, 2]
+                pred_wh = torch.exp(pred_boxes_pos[:, 2:4]) * anchors_for_pos  # [num_pos, 2]
+                
+                target_xy = target_boxes_pos[:, 0:2]  # [num_pos, 2]
+                target_wh = target_boxes_pos[:, 2:4]  # [num_pos, 2]
+                
+                # Get grid coordinates for positive samples
+                grid_coords = pos_indices[:, 1:3].float()  # [num_pos, 2] (y, x)
+                grid_x = grid_coords[:, 1:2]  # [num_pos, 1]
+                grid_y = grid_coords[:, 0:1]  # [num_pos, 1]
+                
+                # Normalize to 0-1
+                pred_xy_norm = (pred_xy + torch.cat([grid_x, grid_y], dim=1)) / grid
+                target_xy_norm = (target_xy + torch.cat([grid_x, grid_y], dim=1)) / grid
+                
+                # Convert to corner format
+                pred_x1y1 = pred_xy_norm - pred_wh / 2
+                pred_x2y2 = pred_xy_norm + pred_wh / 2
+                target_x1y1 = target_xy_norm - target_wh / 2
+                target_x2y2 = target_xy_norm + target_wh / 2
+                
+                # Intersection
+                inter_x1y1 = torch.max(pred_x1y1, target_x1y1)
+                inter_x2y2 = torch.min(pred_x2y2, target_x2y2)
+                inter_wh = (inter_x2y2 - inter_x1y1).clamp(min=0)
+                inter_area = inter_wh[:, 0] * inter_wh[:, 1]
+                
+                # Union
+                pred_area = pred_wh[:, 0] * pred_wh[:, 1]
+                target_area = target_wh[:, 0] * target_wh[:, 1]
+                union = pred_area + target_area - inter_area + eps
+                iou = inter_area / union
+                
+                # Smallest enclosing box
+                c_x1y1 = torch.min(pred_x1y1, target_x1y1)
+                c_x2y2 = torch.max(pred_x2y2, target_x2y2)
+                c_wh = c_x2y2 - c_x1y1
+                c_area = c_wh[:, 0] * c_wh[:, 1] + eps
+                
+                # GIoU
+                giou = iou - (c_area - union) / c_area
+                giou_loss = 1.0 - giou
+                
+                total_box_loss += giou_loss.sum()
                 
                 # Objectness loss for positive samples
-                # Calculate IoU between predicted and target boxes for confidence target
+                # Use the already computed IoU from box loss
                 with torch.no_grad():
-                    pred_xy = torch.sigmoid(pred_boxes_pos[..., 0:2])
-                    pred_wh = torch.exp(pred_boxes_pos[..., 2:4]) * torch.tensor(anchors, device=device).view(1, 1, 1, len(anchors), 2)
-                    target_xy = target_boxes_pos[..., 0:2]
-                    target_wh = target_boxes_pos[..., 2:4]
-                    
-                    # Simple IoU calculation for confidence target
-                    pred_boxes_iou = torch.cat([pred_xy, pred_wh], dim=-1).view(num_pos, 4)
-                    target_boxes_iou = torch.cat([target_xy, target_wh], dim=-1).view(num_pos, 4)
-                    
-                    ious = self._box_iou(pred_boxes_iou, target_boxes_iou)
-                    ious = ious.clamp(0, 1)
+                    # Reuse the IoU we computed above
+                    ious = iou.clamp(0, 1)
                 
                 pred_conf_pos = pred_conf[obj_mask]
                 obj_loss = self.bce_loss(pred_conf_pos, ious)

@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+saved_models/
+weights/
+
+# Data
+dataset/
+data/
+*.zip
+*.tar
+*.gz
+*.csv
+*.json
+*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+runs/
+tensorboard/
+wandb/
+
+# Results
+results/
+outputs/
+predictions/
+*.png
+*.jpg
+*.jpeg
+
+# System Files
+Thumbs.db
+.DS_Store
+*.bak
+*.tmp
+dataset/
+# Project Specific
+# Uncomment if you want to ignore specific files
+# Lab5.ipynb
+# train.py
