@@ -161,9 +161,6 @@ class YOLOv3Loss(nn.Module):
             bsz, grid, _, num_anchors, _ = gt.shape
             pred = pred.view(bsz, grid, grid, num_anchors, -1)
             ###################YOUR CODE HERE#########################
-            obj_mask = gt[..., 4] > 0
-            noobj_mask = gt[..., 4] == 0
-
             pred_boxes = pred[..., 0:4]
             pred_conf = pred[..., 4]
             pred_cls = pred[..., 5:]
@@ -172,75 +169,100 @@ class YOLOv3Loss(nn.Module):
             target_conf = gt[..., 4]
             target_cls = gt[..., 5:]
 
+            # 正負樣本 mask
+            obj_mask = target_conf > 0
+            noobj_mask = target_conf == 0
+
             num_pos = obj_mask.sum().item()
             num_neg = noobj_mask.sum().item()
             total_num_pos += num_pos
             total_num_neg += num_neg
 
+            # 1. box loss：只累加正樣本的 GIoU loss
             if num_pos > 0:
-                # 使用 BoxLoss 計算邊界框損失
-                box_loss = self.box_loss(pred_boxes, target_boxes, anchors)
-                box_loss_pos = box_loss[obj_mask]
-                total_box_loss += box_loss_pos.sum()
+                giou_loss_map = self.box_loss(pred_boxes, target_boxes, anchors)  # [B,S,S,A]
+                total_box_loss += giou_loss_map[obj_mask].sum()
 
-                # 計算 IoU 用於 objectness target
-                with torch.no_grad():
-                    pred_boxes_pos = pred_boxes[obj_mask]
-                    target_boxes_pos = target_boxes[obj_mask]
-                    
-                    pos_indices = obj_mask.nonzero(as_tuple=False)
-                    anchor_indices = pos_indices[:, 3]
-                    
-                    anchor_tensor = torch.tensor(anchors, device=device, dtype=pred_boxes_pos.dtype)
-                    anchors_for_pos = anchor_tensor[anchor_indices]
-                    
-                    eps = 1e-9
-                    pred_xy = torch.sigmoid(pred_boxes_pos[:, 0:2])
-                    pred_wh = torch.exp(pred_boxes_pos[:, 2:4]) * anchors_for_pos
-                    
-                    target_xy = target_boxes_pos[:, 0:2]
-                    target_wh = target_boxes_pos[:, 2:4]
-                    
-                    grid_coords = pos_indices[:, 1:3].float()
-                    grid_x = grid_coords[:, 1:2]
-                    grid_y = grid_coords[:, 0:1]
-                    
-                    pred_xy_norm = (pred_xy + torch.cat([grid_x, grid_y], dim=1)) / grid
-                    target_xy_norm = (target_xy + torch.cat([grid_x, grid_y], dim=1)) / grid
-                    
-                    pred_x1y1 = pred_xy_norm - pred_wh / 2
-                    pred_x2y2 = pred_xy_norm + pred_wh / 2
-                    target_x1y1 = target_xy_norm - target_wh / 2
-                    target_x2y2 = target_xy_norm + target_wh / 2
-                    
-                    inter_x1y1 = torch.max(pred_x1y1, target_x1y1)
-                    inter_x2y2 = torch.min(pred_x2y2, target_x2y2)
-                    inter_wh = (inter_x2y2 - inter_x1y1).clamp(min=0)
-                    inter_area = inter_wh[:, 0] * inter_wh[:, 1]
-                    
-                    pred_area = pred_wh[:, 0] * pred_wh[:, 1]
-                    target_area = target_wh[:, 0] * target_wh[:, 1]
-                    union = pred_area + target_area - inter_area + eps
-                    iou = inter_area / union
-                    ious = iou.clamp(0, 1)
+            # 2. 正樣本 objectness：baseline 版，target = 1
+            if num_pos > 0:
+                pos_indices = obj_mask.nonzero(as_tuple=False)   # [N,4]: (b, y, x, a)
+                pred_boxes_pos = pred_boxes[obj_mask]
+                target_boxes_pos = target_boxes[obj_mask]
 
-                # 使用 FocalLoss 計算 objectness 損失（正樣本）
+                # 取對應 anchor
+                anchor_tensor = torch.tensor(anchors, device=device, dtype=pred_boxes.dtype)
+                anchor_indices = pos_indices[:, 3]
+                anchors_for_pos = anchor_tensor[anchor_indices]
+
+                # 取得該格座標
+                gy = pos_indices[:, 1].float().unsqueeze(1)
+                gx = pos_indices[:, 2].float().unsqueeze(1)
+
+                eps = 1e-9
+
+                # decode 預測中心
+                pred_xy = torch.sigmoid(pred_boxes_pos[..., 0:2])       # cell 內偏移
+                pred_xy_norm = (pred_xy + torch.cat([gx, gy], dim=1)) / grid
+
+                # decode GT 中心（target_boxes[...,0:2] 為 cell 內偏移）
+                target_xy = target_boxes_pos[..., 0:2]
+                target_xy_norm = (target_xy + torch.cat([gx, gy], dim=1)) / grid
+
+                # ★ 寬高：tw,th 先 clamp 再 exp，避免爆炸
+                tw_th_pos = pred_boxes_pos[..., 2:4].clamp(-10, 10)
+                pred_wh = torch.exp(tw_th_pos) * anchors_for_pos
+
+                # GT w,h 已是 normalized，直接用
+                target_wh = target_boxes_pos[..., 2:4]
+
+                # 轉角點
+                pred_x1y1 = pred_xy_norm - pred_wh / 2.0
+                pred_x2y2 = pred_xy_norm + pred_wh / 2.0
+                tgt_x1y1 = target_xy_norm - target_wh / 2.0
+                tgt_x2y2 = target_xy_norm + target_wh / 2.0
+
+                # 交集
+                inter_x1y1 = torch.max(pred_x1y1, tgt_x1y1)
+                inter_x2y2 = torch.min(pred_x2y2, tgt_x2y2)
+                inter_wh = (inter_x2y2 - inter_x1y1).clamp(min=0)
+                inter_area = inter_wh[:, 0] * inter_wh[:, 1]
+
+                # 並集
+                pred_area = (pred_wh[:, 0] * pred_wh[:, 1]).clamp(min=0)
+                tgt_area = (target_wh[:, 0] * target_wh[:, 1]).clamp(min=0)
+                union = pred_area + tgt_area - inter_area + eps
+                iou = (inter_area / union).clamp(0.0, 1.0).detach()
+
+                # ★★ 正樣本 obj 用標準 BCE, target = 1
                 pred_conf_pos = pred_conf[obj_mask]
-                obj_loss = self.focal_loss(pred_conf_pos, ious)
-                total_obj_loss_pos += obj_loss.sum()
+                target_conf_pos = torch.ones_like(pred_conf_pos)
+                pos_obj_loss = self.bce_loss(pred_conf_pos, target_conf_pos)
+                total_obj_loss_pos += pos_obj_loss.sum()
 
-                # 使用 FocalLoss 計算類別損失
+                # 3. 分類損失：只對正樣本，用 BCE（先不用 focal，確認 baseline 正常）
                 pred_cls_pos = pred_cls[obj_mask]
                 target_cls_pos = target_cls[obj_mask]
-                cls_loss = self.focal_loss(pred_cls_pos, target_cls_pos)
+                cls_loss = self.bce_loss(pred_cls_pos, target_cls_pos)
                 total_cls_loss += cls_loss.sum()
+            else:
+                # 若沒有正樣本，保持梯度圖連續
+                total_box_loss += pred_boxes[obj_mask].sum() * 0.0
+                total_obj_loss_pos += pred_conf[obj_mask].sum() * 0.0
+                total_cls_loss += pred_cls[obj_mask].sum() * 0.0
 
+            # 4. 負樣本 objectness：target = 0
             if num_neg > 0:
-                # 使用 FocalLoss 計算 objectness 損失（負樣本）
                 pred_conf_neg = pred_conf[noobj_mask]
                 target_conf_neg = torch.zeros_like(pred_conf_neg)
-                noobj_loss = self.focal_loss(pred_conf_neg, target_conf_neg)
-                total_obj_loss_neg += noobj_loss.sum()   
+
+                # ★★ 負樣本 obj 同樣用 BCE
+                noobj_loss = self.bce_loss(pred_conf_neg, target_conf_neg)
+                total_obj_loss_neg += noobj_loss.sum()
+            else:
+                total_obj_loss_neg += pred_conf[noobj_mask].sum() * 0.0
+
+            
+           
             ##########################################################
         pos_denom = max(total_num_pos, 1)
         neg_denom = max(total_num_neg, 1)
