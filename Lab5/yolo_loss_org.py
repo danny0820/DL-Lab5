@@ -116,7 +116,86 @@ class YOLOv3Loss(nn.Module):
             pred = pred.view(bsz, grid, grid, num_anchors, -1)
             ##################YOUR CODE HERE##########################
             ##########################################################
-            pass
+     # obj_mask = gt[..., 4] > 0
+            # noobj_mask = gt[..., 4] == 0
+
+            # pred_boxes = pred[..., 0:4]
+            # pred_conf = pred[..., 4]
+            # pred_cls = pred[..., 5:]
+
+            # target_boxes = gt[..., 0:4]
+            # target_conf = gt[..., 4]
+            # target_cls = gt[..., 5:]
+
+            # num_pos = obj_mask.sum().item()
+            # num_neg = noobj_mask.sum().item()
+            # total_num_pos += num_pos
+            # total_num_neg += num_neg
+
+            # if num_pos > 0:
+            #     # 使用 BoxLoss 計算邊界框損失
+            #     box_loss = self.box_loss(pred_boxes, target_boxes, anchors)
+            #     box_loss_pos = box_loss[obj_mask]
+            #     total_box_loss += box_loss_pos.sum()
+
+            #     # 計算 IoU 用於 objectness target
+            #     with torch.no_grad():
+            #         pred_boxes_pos = pred_boxes[obj_mask]
+            #         target_boxes_pos = target_boxes[obj_mask]
+                    
+            #         pos_indices = obj_mask.nonzero(as_tuple=False)
+            #         anchor_indices = pos_indices[:, 3]
+                    
+            #         anchor_tensor = torch.tensor(anchors, device=device, dtype=pred_boxes_pos.dtype)
+            #         anchors_for_pos = anchor_tensor[anchor_indices]
+                    
+            #         eps = 1e-9
+            #         pred_xy = torch.sigmoid(pred_boxes_pos[:, 0:2])
+            #         pred_wh = torch.exp(pred_boxes_pos[:, 2:4]) * anchors_for_pos
+                    
+            #         target_xy = target_boxes_pos[:, 0:2]
+            #         target_wh = target_boxes_pos[:, 2:4]
+                    
+            #         grid_coords = pos_indices[:, 1:3].float()
+            #         grid_x = grid_coords[:, 1:2]
+            #         grid_y = grid_coords[:, 0:1]
+                    
+            #         pred_xy_norm = (pred_xy + torch.cat([grid_x, grid_y], dim=1)) / grid
+            #         target_xy_norm = (target_xy + torch.cat([grid_x, grid_y], dim=1)) / grid
+                    
+            #         pred_x1y1 = pred_xy_norm - pred_wh / 2
+            #         pred_x2y2 = pred_xy_norm + pred_wh / 2
+            #         target_x1y1 = target_xy_norm - target_wh / 2
+            #         target_x2y2 = target_xy_norm + target_wh / 2
+                    
+            #         inter_x1y1 = torch.max(pred_x1y1, target_x1y1)
+            #         inter_x2y2 = torch.min(pred_x2y2, target_x2y2)
+            #         inter_wh = (inter_x2y2 - inter_x1y1).clamp(min=0)
+            #         inter_area = inter_wh[:, 0] * inter_wh[:, 1]
+                    
+            #         pred_area = pred_wh[:, 0] * pred_wh[:, 1]
+            #         target_area = target_wh[:, 0] * target_wh[:, 1]
+            #         union = pred_area + target_area - inter_area + eps
+            #         iou = inter_area / union
+            #         ious = iou.clamp(0, 1)
+
+            #     # 使用 FocalLoss 計算 objectness 損失（正樣本）
+            #     pred_conf_pos = pred_conf[obj_mask]
+            #     obj_loss = self.focal_loss(pred_conf_pos, ious)
+            #     total_obj_loss_pos += obj_loss.sum()
+
+            #     # 使用 FocalLoss 計算類別損失
+            #     pred_cls_pos = pred_cls[obj_mask]
+            #     target_cls_pos = target_cls[obj_mask]
+            #     cls_loss = self.focal_loss(pred_cls_pos, target_cls_pos)
+            #     total_cls_loss += cls_loss.sum()
+
+            # if num_neg > 0:
+            #     # 使用 FocalLoss 計算 objectness 損失（負樣本）
+            #     pred_conf_neg = pred_conf[noobj_mask]
+            #     target_conf_neg = torch.zeros_like(pred_conf_neg)
+            #     noobj_loss = self.focal_loss(pred_conf_neg, target_conf_neg)
+            #     total_obj_loss_neg += noobj_loss.sum()  
             ##########################################################
             ##########################################################
             

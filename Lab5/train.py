@@ -22,7 +22,7 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    num_epochs = 50
+    num_epochs = 100
     batch_size = 40
     learning_rate = 1e-3
     lambda_coord = 5.0
