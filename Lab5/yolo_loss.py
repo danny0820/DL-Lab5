@@ -264,7 +264,7 @@ class YOLOv3Loss(nn.Module):
                 giou_loss_map = self.box_loss(pred_boxes, target_boxes, anchors)  # [B,S,S,A]
                 total_box_loss += giou_loss_map[obj_mask].sum()
 
-            # 2. 正樣本 objectness：target = IoU (IoU-aware confidence)
+            # 2. 正樣本 objectness：baseline 版，target = 1
             if num_pos > 0:
                 pos_indices = obj_mask.nonzero(as_tuple=False)   # [N,4]: (b, y, x, a)
                 pred_boxes_pos = pred_boxes[obj_mask]
@@ -289,11 +289,11 @@ class YOLOv3Loss(nn.Module):
                 target_xy = target_boxes_pos[..., 0:2]
                 target_xy_norm = (target_xy + torch.cat([gx, gy], dim=1)) / grid
 
-                # 寬高（pred 用 anchor*exp，gt 直接是 normalized w,h）
-                # pred_wh = torch.exp(pred_boxes_pos[..., 2:4]) * anchors_for_pos
+                # ★ 寬高：tw,th 先 clamp 再 exp，避免爆炸
                 tw_th_pos = pred_boxes_pos[..., 2:4].clamp(-10, 10)
                 pred_wh = torch.exp(tw_th_pos) * anchors_for_pos
-                
+
+                # GT w,h 已是 normalized，直接用
                 target_wh = target_boxes_pos[..., 2:4]
 
                 # 轉角點
@@ -314,18 +314,19 @@ class YOLOv3Loss(nn.Module):
                 union = pred_area + tgt_area - inter_area + eps
                 iou = (inter_area / union).clamp(0.0, 1.0).detach()
 
-                # 正樣本 objectness Focal loss
+                # ★★ 正樣本 obj 用標準 BCE, target = 1
                 pred_conf_pos = pred_conf[obj_mask]
-                obj_loss_pos = self.focal_loss(pred_conf_pos, iou)
-                total_obj_loss_pos += obj_loss_pos.sum()
+                target_conf_pos = torch.ones_like(pred_conf_pos)
+                pos_obj_loss = self.bce_loss(pred_conf_pos, target_conf_pos)
+                total_obj_loss_pos += pos_obj_loss.sum()
 
-                # 3. 分類損失：只對正樣本
+                # 3. 分類損失：只對正樣本，用 BCE（先不用 focal，確認 baseline 正常）
                 pred_cls_pos = pred_cls[obj_mask]
                 target_cls_pos = target_cls[obj_mask]
-                cls_loss = self.focal_loss(pred_cls_pos, target_cls_pos)
+                cls_loss = self.bce_loss(pred_cls_pos, target_cls_pos)
                 total_cls_loss += cls_loss.sum()
-            # 若沒有正樣本，保持梯度圖連續
             else:
+                # 若沒有正樣本，保持梯度圖連續
                 total_box_loss += pred_boxes[obj_mask].sum() * 0.0
                 total_obj_loss_pos += pred_conf[obj_mask].sum() * 0.0
                 total_cls_loss += pred_cls[obj_mask].sum() * 0.0
@@ -334,10 +335,13 @@ class YOLOv3Loss(nn.Module):
             if num_neg > 0:
                 pred_conf_neg = pred_conf[noobj_mask]
                 target_conf_neg = torch.zeros_like(pred_conf_neg)
-                noobj_loss = self.focal_loss(pred_conf_neg, target_conf_neg)
+
+                # ★★ 負樣本 obj 同樣用 BCE
+                noobj_loss = self.bce_loss(pred_conf_neg, target_conf_neg)
                 total_obj_loss_neg += noobj_loss.sum()
             else:
                 total_obj_loss_neg += pred_conf[noobj_mask].sum() * 0.0
+
             
            
             ##########################################################
