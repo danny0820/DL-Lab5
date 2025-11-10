@@ -57,7 +57,9 @@ class BoxLoss(nn.Module):
             eps = 1e-9
             # 預測框的中心點和大小
             pred_xy = torch.sigmoid(pred_boxes[..., 0:2])  # 預測的中心點
-            pred_wh = torch.exp(pred_boxes[..., 2:4]) * anchors  # 預測的寬高
+            # pred_wh = torch.exp(pred_boxes[..., 2:4]) * anchors  # 預測的寬高
+            tw_th = pred_boxes[..., 2:4].clamp(-10, 10)        # 註解：避免exp爆炸
+            pred_wh = torch.exp(tw_th) * anchors
 
             # 真實框的中心點和大小
             target_xy = target_boxes[..., 0:2]
@@ -239,6 +241,7 @@ class YOLOv3Loss(nn.Module):
             #     target_conf_neg = torch.zeros_like(pred_conf_neg)
             #     noobj_loss = self.focal_loss(pred_conf_neg, target_conf_neg)
             #     total_obj_loss_neg += noobj_loss.sum()
+              # 切分預測與標註
             pred_boxes = pred[..., 0:4]
             pred_conf = pred[..., 4]
             pred_cls = pred[..., 5:]
@@ -287,7 +290,10 @@ class YOLOv3Loss(nn.Module):
                 target_xy_norm = (target_xy + torch.cat([gx, gy], dim=1)) / grid
 
                 # 寬高（pred 用 anchor*exp，gt 直接是 normalized w,h）
-                pred_wh = torch.exp(pred_boxes_pos[..., 2:4]) * anchors_for_pos
+                # pred_wh = torch.exp(pred_boxes_pos[..., 2:4]) * anchors_for_pos
+                tw_th_pos = pred_boxes_pos[..., 2:4].clamp(-10, 10)
+                pred_wh = torch.exp(tw_th_pos) * anchors_for_pos
+                
                 target_wh = target_boxes_pos[..., 2:4]
 
                 # 轉角點
@@ -332,6 +338,8 @@ class YOLOv3Loss(nn.Module):
                 total_obj_loss_neg += noobj_loss.sum()
             else:
                 total_obj_loss_neg += pred_conf[noobj_mask].sum() * 0.0
+            
+           
             ##########################################################
         pos_denom = max(total_num_pos, 1)
         neg_denom = max(total_num_neg, 1)
